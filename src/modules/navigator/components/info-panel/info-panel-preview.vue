@@ -6,7 +6,7 @@ Copyright © 2021 - present Aleksey Hoffman. All rights reserved.
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
-import { invoke } from '@tauri-apps/api/core';
+import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import {
   FolderIcon,
   FolderOpenIcon,
@@ -50,6 +50,18 @@ const {
   muteVideoPreviewByDefault,
 } = useInfoPanelVideoPreview(() => props.selectedEntry);
 
+// Office 预览：Rust 侧转换成 PDF，再用 asset URL 喂给 iframe
+interface ConvertOfficeToPdfResult {
+  pdf_path: string;
+  cached: boolean;
+  converter: string;
+}
+
+const officePreviewPdfUrl = ref('');
+const officePreviewLoading = ref(false);
+const officePreviewFailed = ref(false);
+let officePreviewRequestSequence = 0;
+
 const textPreviewContent = ref('');
 const textPreviewLoading = ref(false);
 const textPreviewFailed = ref(false);
@@ -80,6 +92,9 @@ watch(
     textPreviewContent.value = '';
     textPreviewFailed.value = false;
     textPreviewLoading.value = false;
+    officePreviewPdfUrl.value = '';
+    officePreviewFailed.value = false;
+    officePreviewLoading.value = false;
 
     if (!pathAtStart || entryAtStart?.is_dir) {
       return;
@@ -92,6 +107,37 @@ watch(
     }
 
     const previewKind = determineFileType(pathAtStart);
+
+    if (previewKind === 'office') {
+      officePreviewLoading.value = true;
+      const requestSequence = ++officePreviewRequestSequence;
+
+      try {
+        const result = await invoke<ConvertOfficeToPdfResult>('convert_office_to_pdf', {
+          path: pathAtStart,
+        });
+
+        if (requestSequence !== officePreviewRequestSequence || props.selectedEntry?.path !== pathAtStart) {
+          return;
+        }
+
+        officePreviewPdfUrl.value = convertFileSrc(result.pdf_path);
+      }
+      catch {
+        if (requestSequence !== officePreviewRequestSequence || props.selectedEntry?.path !== pathAtStart) {
+          return;
+        }
+
+        officePreviewFailed.value = true;
+      }
+      finally {
+        if (requestSequence === officePreviewRequestSequence && props.selectedEntry?.path === pathAtStart) {
+          officePreviewLoading.value = false;
+        }
+      }
+
+      return;
+    }
 
     if (previewKind === 'text') {
       textPreviewLoading.value = true;
@@ -192,6 +238,32 @@ watch(
         class="info-panel-preview__audio animate-fade-in-x2"
         controls
         preload="metadata"
+      />
+    </div>
+    <div
+      v-else-if="infoPanelPreviewKind === 'office'"
+      class="info-panel-preview__media-container"
+    >
+      <div
+        v-if="officePreviewLoading"
+        class="info-panel-preview__text-status"
+      >
+        <Loader2Icon
+          :size="32"
+          class="info-panel-preview__spinner"
+        />
+      </div>
+      <div
+        v-else-if="officePreviewFailed || !officePreviewPdfUrl"
+        class="info-panel-preview__text-status"
+      >
+        <FileIcon :size="48" />
+      </div>
+      <iframe
+        v-else
+        :src="officePreviewPdfUrl"
+        :title="t('fileBrowser.pdfPreviewFrameTitle')"
+        class="info-panel-preview__pdf animate-fade-in-x2"
       />
     </div>
     <div
