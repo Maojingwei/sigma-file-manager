@@ -5,8 +5,15 @@ name: Build Installer
 on:
   workflow_dispatch:
   push:
-    tags:
-      - 'v*'
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'src-tauri/**'
+      - '.github/workflows/build-installer.yml'
+      - 'package.json'
+      - 'package-lock.json'
+  tags:
+    - 'v*'
 
 permissions:
   contents: read
