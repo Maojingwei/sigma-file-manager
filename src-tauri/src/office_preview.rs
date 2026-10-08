@@ -102,25 +102,26 @@ fn find_wps_cli() -> Option<PathBuf> {
     None
 }
 
-/// Windows 注册表读取工具（避免为一个字符串引入额外依赖）
+/// 读取注册表某个**命名值**（不是默认值）。
+///
+/// 实测教训：WPS 把安装路径放在 `InstallRoot` 命名值里，而**默认值是空字符串**——
+/// 早期版本只读默认值，导致完全探测不到 WPS。
 #[cfg(windows)]
-fn reg_read_default(root: &str, subkey: &str) -> Option<String> {
-    let output = {
-        let mut cmd = Command::new("reg.exe");
-        cmd.args(["query", &format!("{root}\\{subkey}"), "/ve"]);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-        cmd.output().ok()?
-    };
+fn reg_read_value(root: &str, subkey: &str, name: &str) -> Option<String> {
+    let mut cmd = Command::new("reg.exe");
+    cmd.args(["query", &format!("{root}\\{subkey}"), "/v", name]);
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = cmd.output().ok()?;
 
     let text = String::from_utf8_lossy(&output.stdout);
-    // 形如: "    (默认)    REG_SZ    C:\\path\\WPS Office"
     for line in text.lines() {
-        if line.contains("REG_SZ") {
-            if let Some((_, value)) = line.split_once("REG_SZ") {
+        let trimmed = line.trim();
+        // 形如: "    InstallRoot    REG_SZ    D:\\...\\WPS Office\\12.1.0.28505"
+        if trimmed.to_lowercase().starts_with(&name.to_lowercase()) && trimmed.contains("REG_SZ") {
+            if let Some((_, value)) = trimmed.split_once("REG_SZ") {
                 let v = value.trim();
                 if !v.is_empty() {
                     return Some(v.to_string());
@@ -131,53 +132,138 @@ fn reg_read_default(root: &str, subkey: &str) -> Option<String> {
     None
 }
 
-/// 在 Windows 上定位 WPS 的 office6 目录（含 wps.exe / et.exe / wpp.exe）
+/// 从 `reg query ... /ve` 的输出里解析出 exe 所在目录。
+///
+/// 输入行形如：`    (默认)    REG_SZ    "D:\...\office6\wps.exe" /prometheus /wps "%1"`
+/// 抽成纯函数是为了可单元测试（不需要真实注册表）。
+fn parse_wps_dir_from_reg_output(text: &str) -> Option<PathBuf> {
+    for line in text.lines() {
+        let Some((_, value)) = line.split_once("REG_SZ") else {
+            continue;
+        };
+        let value = value.trim();
+        // 取到第一个 .exe 为止
+        let exe_part = match value.to_lowercase().find(".exe") {
+            Some(idx) => &value[..idx + 4],
+            None => continue,
+        };
+        let exe_path = PathBuf::from(exe_part.trim().trim_matches('"'));
+        if let Some(dir) = exe_path.parent() {
+            return Some(dir.to_path_buf());
+        }
+    }
+    None
+}
+
+/// 通过已注册的文件关联反查 WPS 安装目录。
+///
+/// `HKCR\WPS.Docx.6\shell\open\command` 的默认值形如：
+/// `"D:\...\WPS Office\12.1.0.28505\office6\wps.exe" /prometheus /wps "%1"`
+/// 这是**比目录扫描更可靠**的线索（能正确处理装到非系统盘的情况）。
+#[cfg(windows)]
+fn find_wps_dir_from_association() -> Option<PathBuf> {
+    use std::os::windows::process::CommandExt;
+
+    let keys = [
+        r"HKCR\WPS.Docx.6\shell\open\command",
+        r"HKCR\ET.Xlsx.6\shell\open\command",
+        r"HKCR\WPP.PPTX.6\shell\open\command",
+    ];
+
+    for key in keys {
+        let mut cmd = Command::new("reg.exe");
+        cmd.args(["query", key, "/ve"]);
+        cmd.creation_flags(CREATE_NO_WINDOW);
+
+        let Ok(output) = cmd.output() else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+
+        if let Some(dir) = parse_wps_dir_from_reg_output(&text) {
+            if dir.join("wps.exe").is_file() || dir.join("kwpsconvert.exe").is_file() {
+                return Some(dir);
+            }
+        }
+    }
+    None
+}
+
+/// 在 Windows 上定位 WPS 的 office6 目录（含 wps.exe / kwpsconvert.exe）
 #[cfg(windows)]
 fn find_wps_office_dir() -> Option<PathBuf> {
-    // 1) 注册表常见位置
-    let reg_candidates: [(&str, &str); 4] = [
+    let mut roots: Vec<PathBuf> = Vec::new();
+
+    // 1) 注册表 `InstallRoot` 命名值 —— 实测最可靠（能处理非系统盘安装）
+    let mut last_parent: Option<PathBuf> = None;
+    for (root, subkey) in [
         ("HKLM", r"SOFTWARE\Kingsoft\Office\6.0\common"),
         ("HKCU", r"SOFTWARE\Kingsoft\Office\6.0\common"),
         ("HKLM", r"SOFTWARE\WOW6432Node\Kingsoft\Office\6.0\common"),
         ("HKCU", r"SOFTWARE\WOW6432Node\Kingsoft\Office\6.0\common"),
-    ];
-
-    for (root, subkey) in reg_candidates {
-        if let Some(value) = reg_read_default(root, subkey) {
-            let p = PathBuf::from(&value);
-            for candidate in [p.join("office6"), p.clone()] {
-                if candidate.join("wps.exe").is_file() {
-                    return Some(candidate);
-                }
-            }
+    ] {
+        if let Some(value) = reg_read_value(root, subkey, "InstallRoot") {
+            let p = PathBuf::from(value);
+            last_parent = p.parent().map(|x| x.to_path_buf());
+            roots.push(p);
         }
     }
 
-    // 2) 在常见安装根的下一级目录里找（WPS 版本号目录名会变，所以扫一层）
-    let mut roots: Vec<PathBuf> = Vec::new();
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        roots.push(PathBuf::from(local).join("Kingsoft").join("WPS Office"));
-    }
-    if let Some(pf) = std::env::var_os("ProgramFiles") {
-        roots.push(PathBuf::from(pf).join("Kingsoft").join("WPS Office"));
-    }
-    if let Some(pf) = std::env::var_os("ProgramFiles(x86)") {
-        roots.push(PathBuf::from(pf).join("Kingsoft").join("WPS Office"));
+    // 2) 文件关联反查
+    if let Some(dir) = find_wps_dir_from_association() {
+        roots.push(dir);
     }
 
-    for root in roots {
-        let Ok(entries) = std::fs::read_dir(&root) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let office6 = entry.path().join("office6");
-            if office6.join("wps.exe").is_file() {
-                return Some(office6);
+    // 3) 常规候选目录（同盘 + 跨盘：KINGSOFT 可能装在 D:）
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for var in ["LOCALAPPDATA", "APPDATA", "ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(base) = std::env::var_os(var) {
+            candidates.push(PathBuf::from(base).join("Kingsoft").join("WPS Office"));
+        }
+    }
+    // 从 InstallRoot 的父目录（即 "...\Kingsoft\WPS Office"）也扫一遍，
+    // 这样能覆盖"新版装在 D 盘、LOCALAPPDATA 在 C 盘"的情况
+    if let Some(p) = last_parent {
+        candidates.push(p);
+    }
+
+    for candidate in candidates {
+        for dir in expand_version_dirs(&candidate) {
+            roots.push(dir);
+        }
+    }
+
+    // 逐个校验：目录里有 wps.exe 或 kwpsconvert.exe
+    for r in roots {
+        for probe in [r.clone(), r.join("office6")] {
+            if probe.join("wps.exe").is_file() || probe.join("kwpsconvert.exe").is_file() {
+                return Some(probe);
             }
         }
     }
 
     None
+}
+
+/// 展开 "<root>\<版本号>\office6" 这类目录（WPS 版本号目录名会变，故扫一层）
+#[cfg(windows)]
+fn expand_version_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            let o6 = p.join("office6");
+            if o6.is_dir() {
+                out.push(o6);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
 }
 
 /// 探测可用的转换器
@@ -482,5 +568,24 @@ mod tests {
                 "扩展名 .{ext} 在 OFFICE_EXTENSIONS 里，但没有对应的 wpscli 子命令"
             );
         }
+    }
+
+    #[test]
+    fn parses_wps_dir_from_reg_output() {
+        // 真实机器上的 `reg query HKCR\WPS.Docx.6\shell\open\command /ve` 输出形态
+        let sample = concat!(
+            "\r\n",
+            "HKEY_CLASSES_ROOT\\WPS.Docx.6\\shell\\open\\command\r\n",
+            "    (默认)    REG_SZ    \"D:\\Users\\Administrator\\AppData\\Local\\Kingsoft\\WPS Office\\12.1.0.28505\\office6\\wps.exe\" /prometheus /wps \"%1\"\r\n",
+        );
+        let dir = parse_wps_dir_from_reg_output(sample).expect("应能解析出目录");
+        let s = dir.to_string_lossy().replace('/', "\\");
+        assert!(s.ends_with(r"WPS Office\12.1.0.28505\office6"), "实际: {s}");
+    }
+
+    #[test]
+    fn reg_output_without_exe_yields_none() {
+        let sample = "HKEY_CLASSES_ROOT\\Foo\r\n    (默认)    REG_SZ    \r\n";
+        assert!(parse_wps_dir_from_reg_output(sample).is_none());
     }
 }
