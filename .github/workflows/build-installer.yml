@@ -1,0 +1,75 @@
+name: Build Installer
+
+# 产出可运行的 Windows 安装包（含 Office 预览功能）
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: 构建 Windows 安装包
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Volta
+        uses: volta-cli/action@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+          shared-key: office-preview-release
+          workspaces: src-tauri
+          cache-on-failure: true
+
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: 构建 Tauri 应用（NSIS 安装包）
+        run: npm run tauri:build -- --bundles nsis
+        env:
+          # 跳过签名（私有 fork，无签名证书）
+          TAURI_SIGNING_PRIVATE_KEY: ''
+
+      - name: 列出产物
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse -Path src-tauri/target/release/bundle -File -ErrorAction SilentlyContinue |
+            ForEach-Object { "$($_.FullName)  ($([math]::Round($_.Length/1MB,1)) MB)" }
+
+      - name: 上传安装包
+        uses: actions/upload-artifact@v4
+        with:
+          name: sfm-office-preview-windows
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: 上传主程序（免安装直接跑）
+        uses: actions/upload-artifact@v4
+        with:
+          name: sfm-office-preview-portable
+          path: src-tauri/target/release/*.exe
+          if-no-files-found: warn
+          retention-days: 30
