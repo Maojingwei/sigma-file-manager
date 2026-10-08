@@ -18,12 +18,14 @@ import {
   runAuxiliaryWindowTask,
 } from '@/utils/auxiliary-windows';
 
-export type QuickViewFileType = 'image' | 'video' | 'audio' | 'pdf' | 'text' | 'unsupported';
+export type QuickViewFileType = 'image' | 'video' | 'audio' | 'pdf' | 'text' | 'office' | 'unsupported';
 
 const IMAGE_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'ico', 'tiff', 'tif', 'avif'];
 const VIDEO_EXTENSIONS = ['mp4', 'webm', 'ogg', 'ogv', 'mov', 'avi', 'mkv', 'm4v', 'wmv', 'flv'];
 const AUDIO_EXTENSIONS = ['mp3', 'wav', 'ogg', 'oga', 'flac', 'aac', 'm4a', 'wma', 'opus'];
 const PDF_EXTENSIONS = ['pdf'];
+// Office 文档：由 Rust 侧转换成 PDF 后复用 PDF 预览通道（见 src-tauri/src/office_preview.rs）
+const OFFICE_EXTENSIONS = ['docx', 'doc', 'xlsx', 'xls', 'pptx', 'ppt', 'rtf', 'odt', 'ods', 'odp'];
 const TEXT_EXTENSIONS = ['txt', 'md', 'json', 'xml', 'html', 'css', 'js', 'ts', 'vue', 'jsx', 'tsx', 'yaml', 'yml', 'toml', 'ini', 'cfg', 'conf', 'log', 'sh', 'bash', 'zsh', 'ps1', 'bat', 'cmd', 'py', 'rb', 'rs', 'go', 'java', 'c', 'cpp', 'h', 'hpp', 'cs', 'swift', 'kt', 'php', 'sql', 'graphql', 'env', 'gitignore', 'dockerignore', 'editorconfig', 'prettierrc', 'eslintrc'];
 
 export function isHttpOrHttpsUrl(value: string): boolean {
@@ -72,6 +74,7 @@ export function determineFileType(path: string): QuickViewFileType {
   if (VIDEO_EXTENSIONS.includes(extension)) return 'video';
   if (AUDIO_EXTENSIONS.includes(extension)) return 'audio';
   if (PDF_EXTENSIONS.includes(extension)) return 'pdf';
+  if (OFFICE_EXTENSIONS.includes(extension)) return 'office';
   if (TEXT_EXTENSIONS.includes(extension)) return 'text';
 
   return 'unsupported';
