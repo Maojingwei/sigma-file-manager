@@ -602,4 +602,164 @@ mod tests {
         let s = dir.to_string_lossy().replace('/', "\\");
         assert!(s.ends_with(r"office6"), "实际: {s}");
     }
+
+    // ─────────────────────────────────────────────────────────────
+    // 集成测试：真正调用转换器（默认忽略，因为多数环境没装转换器）
+    //
+    // 运行方式：
+    //   cargo test --lib office_preview -- --ignored --nocapture
+    //
+    // 该测试覆盖：detect_converter -> run_conversion -> PDF 产物校验，
+    // 也就是把本模块的**真实执行路径**跑一遍，而不只是逻辑分支。
+    // ─────────────────────────────────────────────────────────────
+
+    /// 极简 DOCX 生成（DOCX 就是 ZIP + 若干 XML）。
+    /// 手写 ZIP 是为了不引入额外依赖 —— 只用 stored(不压缩) 方式。
+    fn build_minimal_docx(path: &Path) -> std::io::Result<()> {
+        let xml_files: Vec<(&str, String)> = vec![
+            (
+                "[Content_Types].xml",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#.to_string(),
+            ),
+            (
+                "_rels/.rels",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#.to_string(),
+            ),
+            (
+                "word/document.xml",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Sigma File Manager office preview integration test</w:t></w:r></w:p></w:body></w:document>"#.to_string(),
+            ),
+        ];
+
+        let mut out: Vec<u8> = Vec::new();
+        let mut central: Vec<u8> = Vec::new();
+
+        for (name, content) in &xml_files {
+            let data = content.as_bytes();
+            let crc = crc32(data);
+            let offset = out.len() as u32;
+
+            // Local file header
+            out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+            out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+            out.extend_from_slice(&0u16.to_le_bytes()); // flags
+            out.extend_from_slice(&0u16.to_le_bytes()); // method = stored
+            out.extend_from_slice(&0u16.to_le_bytes()); // mod time
+            out.extend_from_slice(&0u16.to_le_bytes()); // mod date
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes()); // compressed
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes()); // uncompressed
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // extra len
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(data);
+
+            // Central directory entry
+            central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes()); // version made by
+            central.extend_from_slice(&20u16.to_le_bytes()); // version needed
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes()); // extra
+            central.extend_from_slice(&0u16.to_le_bytes()); // comment
+            central.extend_from_slice(&0u16.to_le_bytes()); // disk
+            central.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+            central.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name.as_bytes());
+        }
+
+        let central_offset = out.len() as u32;
+        let central_size = central.len() as u32;
+        let count = xml_files.len() as u16;
+        out.extend_from_slice(&central);
+
+        // End of central directory
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // disk
+        out.extend_from_slice(&0u16.to_le_bytes()); // disk with central
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&central_size.to_le_bytes());
+        out.extend_from_slice(&central_offset.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // comment len
+
+        std::fs::write(path, out)
+    }
+
+    /// 标准 CRC-32（ZIP 用）
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc: u32 = 0xffff_ffff;
+        for byte in data {
+            crc ^= *byte as u32;
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
+    #[test]
+    fn crc32_matches_known_vector() {
+        // 标准测试向量
+        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+    }
+
+    #[test]
+    fn generates_valid_zip_signature() {
+        let dir = std::env::temp_dir().join("sfm-office-preview-test-zip");
+        let _ = std::fs::create_dir_all(&dir);
+        let docx = dir.join("gen.docx");
+        build_minimal_docx(&docx).expect("生成 docx 失败");
+
+        let bytes = std::fs::read(&docx).expect("读回失败");
+        assert!(bytes.len() > 100, "文件太小: {}", bytes.len());
+        assert_eq!(&bytes[0..2], b"PK", "ZIP 头应为 PK");
+        // 结尾应是 EOCD 签名
+        assert!(
+            bytes.windows(4).any(|w| w == [0x50, 0x4b, 0x05, 0x06]),
+            "缺少 EOCD 记录"
+        );
+    }
+
+    #[test]
+    #[ignore = "需要本机已安装 LibreOffice 或 WPS；用 --ignored 运行"]
+    fn integration_converts_real_document_to_pdf() {
+        let converter = match detect_converter() {
+            Some(c) => c,
+            None => {
+                eprintln!("跳过：本机未探测到 LibreOffice / WPS 转换器");
+                return;
+            }
+        };
+        eprintln!(
+            "使用转换器: {} -> {}",
+            converter.kind,
+            converter.program.display()
+        );
+
+        let dir = std::env::temp_dir().join("sfm-office-preview-integration");
+        let _ = std::fs::create_dir_all(&dir);
+        let docx = dir.join("integration.docx");
+        build_minimal_docx(&docx).expect("生成测试 docx 失败");
+        eprintln!("测试文档: {} ({} 字节)", docx.display(), std::fs::metadata(&docx).unwrap().len());
+
+        let out_dir = dir.join("out");
+        let pdf = run_conversion(&converter, &docx, &out_dir).expect("转换失败");
+        eprintln!("产物: {} ({} 字节)", pdf.display(), std::fs::metadata(&pdf).unwrap().len());
+
+        let head = std::fs::read(&pdf).expect("读取产物失败");
+        assert!(head.len() > 400, "PDF 过小，可能是空产物");
+        assert_eq!(&head[0..5], b"%PDF-", "产物不是有效 PDF");
+    }
 }
