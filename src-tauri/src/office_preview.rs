@@ -41,6 +41,12 @@ struct Converter {
     kind: &'static str,
 }
 
+/// Prober 可执行文件的候选名称。
+/// 注意：WPS 的转换能力不在 wps.exe 上，而在同目录的 **kwpsconvert.exe**（wpscli）。
+/// 实测 `wps.exe --convert-to` 无效；`kwpsconvert.exe word2pdf ...` 才可用。
+#[cfg(windows)]
+const PROBER_NAMES: &[&str] = &["wpscli.exe", "kwpsconvert.exe"];
+
 /// 在 PATH 中查找可执行文件
 fn find_in_path(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
@@ -60,6 +66,37 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
             if candidate.is_file() {
                 return Some(candidate);
             }
+        }
+    }
+    None
+}
+
+/// 按扩展名选择 wpscli 的转换子命令
+fn wps_subcommand(ext: &str) -> Option<&'static str> {
+    match ext {
+        "docx" | "doc" | "dot" | "rtf" | "wps" | "odt" => Some("word2pdf"),
+        "xlsx" | "xls" | "ods" => Some("excel2pdf"),
+        "pptx" | "ppt" | "odp" => Some("ppt2pdf"),
+        _ => None,
+    }
+}
+
+/// 找到 WPS 的 kwpsconvert.exe（真正的转换器）
+#[cfg(windows)]
+fn find_wps_cli() -> Option<PathBuf> {
+    // 1) PATH 里找
+    for name in PROBER_NAMES {
+        if let Some(p) = find_in_path(name) {
+            return Some(p);
+        }
+    }
+
+    // 2) office6 目录里找（wps.exe 通常不在 PATH 上）
+    let dir = find_wps_office_dir()?;
+    for name in PROBER_NAMES {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
         }
     }
     None
@@ -167,17 +204,14 @@ fn detect_converter() -> Option<Converter> {
         }
     }
 
-    // 2) Windows 上回退 WPS
+    // 2) Windows 上回退 WPS（用 kwpsconvert.exe，不是 wps.exe）
     #[cfg(windows)]
     {
-        if let Some(dir) = find_wps_office_dir() {
-            let wps = dir.join("wps.exe");
-            if wps.is_file() {
-                return Some(Converter {
-                    program: wps,
-                    kind: "wps",
-                });
-            }
+        if let Some(cli) = find_wps_cli() {
+            return Some(Converter {
+                program: cli,
+                kind: "wps",
+            });
         }
     }
 
@@ -227,12 +261,22 @@ fn run_conversion(converter: &Converter, source: &Path, out_dir: &Path) -> Resul
     let mut cmd = Command::new(&converter.program);
     match converter.kind {
         "wps" => {
-            // WPS: wps.exe <src> --convert-to pdf --outdir <dir>
-            cmd.arg(source)
-                .arg("--convert-to")
-                .arg("pdf")
-                .arg("--outdir")
-                .arg(out_dir);
+            // WPS: kwpsconvert.exe <subcommand> <input> --output <file.pdf>
+            // 实测语法（wpscli --help）：
+            //   wpscli word2pdf  <input> [--output <file.pdf>]
+            //   wpscli excel2pdf <input> [--output <file.pdf>]
+            //   wpscli ppt2pdf   <input> [--output <file.pdf>]
+            let ext = source
+                .extension()
+                .map(|e| e.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            let subcommand = wps_subcommand(&ext)
+                .ok_or_else(|| format!("No wpscli subcommand for extension .{ext}"))?;
+
+            cmd.arg(subcommand)
+                .arg(source)
+                .arg("--output")
+                .arg(&out_pdf);
         }
         _ => {
             // LibreOffice: soffice --headless --convert-to pdf --outdir <dir> <src>
@@ -247,7 +291,7 @@ fn run_conversion(converter: &Converter, source: &Path, out_dir: &Path) -> Resul
     }
 
     // 关键：不要捕获 stdout/stderr 管道（沙箱/侧车环境下管道可能不可用），
-    // 也让子进程不弹控制台窗口。转换成功与否用产物文件判断。
+    // 也让子进程不弹控制台窗口。转换成功与否用退出码 + 产物文件判断。
     cmd.stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .stdin(std::process::Stdio::null());
@@ -263,10 +307,22 @@ fn run_conversion(converter: &Converter, source: &Path, out_dir: &Path) -> Resul
         .map_err(|error| format!("Failed to run {}: {error}", converter.kind))?;
 
     if !status.success() {
+        let code = status.code();
+        // wpscli 的退出码语义（见 wpscli <sub> --help）
+        let hint = match code {
+            Some(100) => " (WPS is not signed in)",
+            Some(101) => " (WPS account lacks the required privilege)",
+            Some(207) => " (input file exceeds 200 MB)",
+            Some(209) => " (source document requires a password)",
+            Some(210) => " (wrong document password)",
+            Some(203) => " (input file not found)",
+            Some(211) => " (output directory does not exist)",
+            Some(212) => " (no write permission to output directory)",
+            _ => "",
+        };
         return Err(format!(
-            "{} exited with status {:?}",
-            converter.kind,
-            status.code()
+            "{} exited with status {code:?}{hint}",
+            converter.kind
         ));
     }
 
@@ -399,6 +455,32 @@ mod tests {
     fn extension_list_is_lowercase() {
         for ext in OFFICE_EXTENSIONS {
             assert_eq!(*ext, ext.to_lowercase());
+        }
+    }
+
+    #[test]
+    fn wps_subcommand_mapping_is_correct() {
+        // 实测确认的 wpscli 子命令映射
+        assert_eq!(wps_subcommand("docx"), Some("word2pdf"));
+        assert_eq!(wps_subcommand("doc"), Some("word2pdf"));
+        assert_eq!(wps_subcommand("rtf"), Some("word2pdf"));
+        assert_eq!(wps_subcommand("xlsx"), Some("excel2pdf"));
+        assert_eq!(wps_subcommand("xls"), Some("excel2pdf"));
+        assert_eq!(wps_subcommand("pptx"), Some("ppt2pdf"));
+        assert_eq!(wps_subcommand("ppt"), Some("ppt2pdf"));
+        // 非 Office 类型不应有子命令
+        assert_eq!(wps_subcommand("pdf"), None);
+        assert_eq!(wps_subcommand("txt"), None);
+    }
+
+    #[test]
+    fn every_office_extension_has_a_subcommand() {
+        // 保证扩展名列表与子命令映射不脱节
+        for ext in OFFICE_EXTENSIONS {
+            assert!(
+                wps_subcommand(ext).is_some(),
+                "扩展名 .{ext} 在 OFFICE_EXTENSIONS 里，但没有对应的 wpscli 子命令"
+            );
         }
     }
 }
