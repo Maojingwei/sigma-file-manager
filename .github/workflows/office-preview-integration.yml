@@ -1,0 +1,82 @@
+name: Integration Conversion
+
+# 在真实环境验证 office_preview 模块的转换路径：
+# 安装一个转换器（WPS 或 LibreOffice），然后跑被 #[ignore] 标记的集成测试。
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'src-tauri/src/office_preview.rs'
+      - '.github/workflows/office-preview-integration.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  convert:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+          shared-key: office-preview-integration
+          workspaces: src-tauri
+          cache-on-failure: true
+
+      - name: Install converter (try LibreOffice first, then WPS)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Write-Host "== 尝试 LibreOffice =="
+          try {
+            choco install libreoffice-fresh -y --no-progress
+            Write-Host "libreoffice-fresh 安装完成"
+          } catch {
+            Write-Host "libreoffice-fresh 失败: $_"
+          }
+          if (-not (Get-Command soffice -ErrorAction SilentlyContinue)) {
+            Write-Host "== 尝试 WPS =="
+            try {
+              winget install --id Kingsoft.WPSOffice --accept-package-agreements --accept-source-agreements --disable-interactivity
+            } catch {
+              Write-Host "WPS 安装失败: $_"
+            }
+          }
+
+      - name: Report detected converter
+        shell: pwsh
+        run: |
+          Write-Host "--- PATH 里找 soffice ---"
+          where.exe soffice 2>$null
+          Write-Host "--- 常见 LibreOffice 路径 ---"
+          Get-ChildItem 'C:\Program Files\LibreOffice\program\soffice.exe','C:\Program Files (x86)\LibreOffice\program\soffice.exe' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+          Write-Host "--- WPS 注册表 ---"
+          reg query "HKLM\SOFTWARE\Kingsoft\Office\6.0\common" /v InstallRoot 2>$null
+          reg query "HKCU\SOFTWARE\Kingsoft\Office\6.0\common" /v InstallRoot 2>$null
+          Write-Host "--- kraftconvert/kwpsconvert ---"
+          Get-ChildItem "$env:LOCALAPPDATA\Kingsoft","$env:ProgramFiles\Kingsoft","D:\" -Recurse -Filter 'kwpsconvert.exe' -ErrorAction SilentlyContinue -Depth 6 | Select-Object -First 5 -ExpandProperty FullName
+
+      - name: Run integration conversion test (ignored tests)
+        shell: pwsh
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --release --lib office_preview -- --ignored --nocapture --test-threads=1
+
+      - name: Run all office_preview unit tests
+        shell: pwsh
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --release --lib office_preview -- --nocapture
