@@ -142,12 +142,17 @@ fn parse_wps_dir_from_reg_output(text: &str) -> Option<PathBuf> {
             continue;
         };
         let value = value.trim();
-        // 取到第一个 .exe 为止
-        let exe_part = match value.to_lowercase().find(".exe") {
-            Some(idx) => &value[..idx + 4],
-            None => continue,
+        // 取到第一个 ".exe" 为止。
+        // 注意：这里用**字符**匹配而不是字节下标——路径可能含非 ASCII 字符
+        // （例如中文用户名），按字节切片会切在字符边界上导致 panic。
+        let lower = value.to_lowercase();
+        let Some(idx) = lower.find(".exe") else {
+            continue;
         };
-        let exe_path = PathBuf::from(exe_part.trim().trim_matches('"'));
+        let end = idx + 4;
+        // 用 chars 重建，保证边界安全
+        let exe_path_str: String = value.chars().take(end).collect();
+        let exe_path = PathBuf::from(exe_path_str.trim().trim_matches('"'));
         if let Some(dir) = exe_path.parent() {
             return Some(dir.to_path_buf());
         }
@@ -587,5 +592,14 @@ mod tests {
     fn reg_output_without_exe_yields_none() {
         let sample = "HKEY_CLASSES_ROOT\\Foo\r\n    (默认)    REG_SZ    \r\n";
         assert!(parse_wps_dir_from_reg_output(sample).is_none());
+    }
+
+    #[test]
+    fn parses_non_ascii_path_without_panic() {
+        // 中文用户名/中文路径不能让解析 panic（曾用字节切片导致越界）
+        let sample = "    (默认)    REG_SZ    \"D:\\用户\\张三\\Kingsoft\\WPS Office\\12.1.0.28505\\office6\\wps.exe\" /prometheus\n";
+        let dir = parse_wps_dir_from_reg_output(sample).expect("非 ASCII 路径也应能解析");
+        let s = dir.to_string_lossy().replace('/', "\\");
+        assert!(s.ends_with(r"office6"), "实际: {s}");
     }
 }
