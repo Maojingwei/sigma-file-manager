@@ -142,17 +142,33 @@ fn parse_wps_dir_from_reg_output(text: &str) -> Option<PathBuf> {
             continue;
         };
         let value = value.trim();
+
         // 取到第一个 ".exe" 为止。
-        // 注意：这里用**字符**匹配而不是字节下标——路径可能含非 ASCII 字符
-        // （例如中文用户名），按字节切片会切在字符边界上导致 panic。
-        let lower = value.to_lowercase();
-        let Some(idx) = lower.find(".exe") else {
+        //
+        // 安全要点：这里**必须按字符**定位与切片，不能混用字节/小写字符串下标——
+        // 路径可能含非 ASCII 字符（例如中文用户名），
+        // 而 `to_lowercase()` 对某些字符会改变**字符数**，用它的下标去切原串会错位或越界。
+        let chars: Vec<char> = value.chars().collect();
+        let lower: Vec<char> = value.to_lowercase().chars().collect();
+
+        let mut end: Option<usize> = None;
+        if lower.len() >= 4 {
+            for i in 0..=(lower.len() - 4) {
+                if lower[i] == '.' && lower[i + 1] == 'e' && lower[i + 2] == 'x' && lower[i + 3] == 'e' {
+                    end = Some(i + 4);
+                    break;
+                }
+            }
+        }
+
+        let Some(end) = end else {
             continue;
         };
-        let end = idx + 4;
-        // 用 chars 重建，保证边界安全
-        let exe_path_str: String = value.chars().take(end).collect();
+        // 小写化可能改变长度；取两者较小值保证不越界
+        let end = end.min(chars.len());
+        let exe_path_str: String = chars[..end].iter().collect();
         let exe_path = PathBuf::from(exe_path_str.trim().trim_matches('"'));
+
         if let Some(dir) = exe_path.parent() {
             return Some(dir.to_path_buf());
         }
