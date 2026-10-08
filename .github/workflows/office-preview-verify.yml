@@ -1,0 +1,71 @@
+name: Verify Office Preview
+
+# 验证 Office 预览改动：前端类型检查 + 构建，Rust 侧 cargo check
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: 前端类型检查与构建
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Volta
+        uses: volta-cli/action@v4
+
+      - name: Node 版本
+        run: node --version && npm --version
+
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check（vue-tsc）
+        run: npm run ts
+
+      - name: 构建前端
+        run: npm run build-only
+
+  tauri-windows:
+    name: Rust 编译检查
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+          shared-key: office-preview-windows
+          workspaces: src-tauri
+          cache-on-failure: true
+
+      - name: Cargo check（含 office_preview 模块）
+        run: cargo check --manifest-path src-tauri/Cargo.toml --release --lib
+
+      - name: Cargo test（lib 单元测试）
+        run: cargo test --manifest-path src-tauri/Cargo.toml --release --lib
+        continue-on-error: true
