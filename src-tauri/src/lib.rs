@@ -21,6 +21,7 @@ mod input_simulation;
 mod lan_share;
 mod link_operations;
 mod main_window_state;
+mod office_preview;
 mod open_with;
 mod process_runner;
 mod startup_storage_bootstrap;
@@ -382,6 +383,8 @@ pub fn run() {
             extensions::read_extension_manifest,
             extensions::read_extension_file,
             extensions::read_text_preview,
+            office_preview::convert_office_to_pdf,
+            office_preview::get_office_converter_info,
             extensions::read_file_binary,
             extensions::write_file_binary,
             extensions::import_extension_storage_file,
